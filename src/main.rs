@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use libc;
 use std::fs;
 use std::os::unix::fs::chroot;
 use tempfile::tempdir;
@@ -25,6 +26,10 @@ fn main() -> Result<()> {
 
     chroot(tmp_dir.path())
         .with_context(|| format!("Tried to chroot into {}", tmp_dir.path().display()))?;
+
+    unsafe {
+        libc::unshare(libc::CLONE_NEWPID);
+    }
 
     let command_args = &args[4..];
     let output = std::process::Command::new(command)
