@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use libc;
 use std::fs;
 use std::os::unix::fs::chroot;
 use tempfile::tempdir;
