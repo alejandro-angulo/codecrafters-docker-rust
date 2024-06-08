@@ -38,9 +38,9 @@ fn main() -> Result<()> {
         })?;
 
     // Cleanup
-    fs::remove_dir_all(tmp_dir.path())
-        .with_context(|| "Tried to cleanup temporary directory".to_string())?;
-    drop(tmp_dir);
+    // fs::remove_dir_all(tmp_dir.path())
+    //     .with_context(|| "Tried to cleanup temporary directory".to_string())?;
+    // drop(tmp_dir);
 
     let status_code = output.status.code().unwrap_or_default();
     let std_out = std::str::from_utf8(&output.stdout)?;
