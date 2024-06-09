@@ -37,13 +37,7 @@
               languages.rust.enable = true;
               languages.shell.enable = true;
 
-              packages = [pkgs.hello];
-
-              enterShell = ''
-                hello
-              '';
-
-              processes.hello.exec = "hello";
+              packages = [pkgs.openssl];
             }
           ];
         };
