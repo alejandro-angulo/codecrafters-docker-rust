@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
+use flate2::read::GzDecoder;
 use serde_json::Value;
 use std::fs;
 use std::os::unix::fs::chroot;
 use std::path::Path;
 use tempfile::tempdir;
+
+static DOCKER_HUB: &str = "registry.hub.docker.com";
 
 // Usage: your_docker.sh run <image> <command> <arg1> <arg2> ...
 fn main() -> Result<()> {
@@ -17,7 +20,7 @@ fn main() -> Result<()> {
         image_tag = image_parts.get(1).unwrap();
     }
 
-    let auth_token = get_auth_token(image_name, image_tag)?;
+    let auth_token = get_auth_token(image_name)?;
     let layers = fetch_image_manifest(image_name, image_tag, &auth_token)?;
 
     let tmp_dir = tempdir().with_context(|| "Tried to create temporary directory".to_string())?;
@@ -34,10 +37,9 @@ fn main() -> Result<()> {
     fs::copy(command, target_chroot_path)
         .with_context(|| "Tried to copy executable into chroot".to_string())?;
 
-    fs::create_dir(tmp_dir.path().join("dev"))
-        .with_context(|| "Tried to create dev directory inside chroot".to_string())?;
-    fs::write(tmp_dir.path().join("dev/null"), b"")
-        .with_context(|| "Tried to create empty /dev/null file inside chroot")?;
+    // /dev/null might already exist depending on the layers we pull, fail silently
+    let _ = fs::create_dir(tmp_dir.path().join("dev"));
+    let _ = fs::write(tmp_dir.path().join("dev/null"), b"");
 
     chroot(tmp_dir.path())
         .with_context(|| format!("Tried to chroot into {}", tmp_dir.path().display()))?;
@@ -77,15 +79,16 @@ fn main() -> Result<()> {
 /// a token with the pull scope.
 ///
 /// See: https://distribution.github.io/distribution/spec/auth/jwt/
-fn get_auth_token(image_name: &str, image_tag: &str) -> Result<String, anyhow::Error> {
+fn get_auth_token(image_name: &str) -> Result<String, anyhow::Error> {
     let auth_response = reqwest::blocking::get(format!(
-        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:{}:{}:pull",
-        image_name, image_tag
+        "https://auth.docker.io/token?service=registry.docker.io&scope=repository:library/{}:pull",
+        image_name
     ))
     .context("Tried to request an auth token")?;
-    let parsed_response: Value = serde_json::from_str(auth_response.text().unwrap().as_str())
+    let raw_data = auth_response.text().unwrap();
+    let parsed_response: Value = serde_json::from_str(raw_data.as_str())
         .context("Tried to parse docker registry's auth response")?;
-    Ok(parsed_response["token"].to_string())
+    Ok(String::from(parsed_response["token"].as_str().unwrap()))
 }
 
 /// Retrieves an image's manifest
@@ -100,30 +103,36 @@ fn fetch_image_manifest(
 
     let manifest_response = client
         .get(format!(
-            "https://index.docker.io/v2/library/{}/manifests/{}",
-            image_name, image_tag
+            "https://{}/v2/library/{}/manifests/{}",
+            DOCKER_HUB, image_name, image_tag
         ))
-        .header("Authorization", format!("Bearer {}", token))
+        .bearer_auth(token)
         .header(
             "Accept",
             "application/vnd.docker.distribution.manifest.v2+json",
         )
         .send()
         .context("Tried fetching image manifest")?;
-    let parsed_response: Value = serde_json::from_str(manifest_response.text().unwrap().as_str())
-        .context("Tried to parsed docker's manifest response")?;
+    let raw_data = manifest_response.text().unwrap();
+    let parsed_response: Value =
+        serde_json::from_str(&raw_data).context("Tried to parsed docker's manifest response")?;
 
     let mut layers: Vec<String> = Vec::new();
-    if let Some(layers_arr) = parsed_response["fsLayers"].as_array() {
-        layers.extend(layers_arr.iter().map(|l| l["blobSum"].to_string()));
-        // for layer in layers_arr {
-        //     layers.push(layer.as_str().unwrap().to_string());
-        // }
-    }
+    let layers_arr = parsed_response["layers"]
+        .as_array()
+        .expect("No layers found in manifest response");
+    layers.extend(
+        layers_arr
+            .iter()
+            .map(|l| String::from(l["digest"].as_str().unwrap())),
+    );
 
     Ok(layers)
 }
 
+/// Fetch the images and save them to disk
+///
+/// See: https://distribution.github.io/distribution/spec/api/#pulling-a-layer
 fn fetch_image_layers(
     layers: Vec<String>,
     image_name: &str,
@@ -136,20 +145,21 @@ fn fetch_image_layers(
     for layer in layers {
         let blob_response = client
             .get(format!(
-                "https://index.docker.io/v2/library/{}/blobs/{}",
-                layer, image_name
+                "https://{}/v2/library/{}/blobs/{}",
+                DOCKER_HUB, image_name, layer
             ))
-            .header("Authorization", format!("Bearer {}", token))
+            .bearer_auth(token)
             .send()
             .with_context(|| format!("Tried fetching layer {}", layer))?;
         let gzipped_tar_data = blob_response.bytes()?;
 
-        // TODO: Uncompress and store to disk
-        let tar_data = flate2::read::GzDecoder::new(&gzipped_tar_data[..]);
+        let tar_data = GzDecoder::new(&gzipped_tar_data[..]);
         let mut archive = tar::Archive::new(tar_data);
         archive.set_preserve_permissions(true);
         archive.set_unpack_xattrs(true);
-        archive.unpack(destination)?;
+        archive
+            .unpack(destination)
+            .context(format!("Unable to unpack to {}", destination.display()))?;
     }
 
     Ok(())
